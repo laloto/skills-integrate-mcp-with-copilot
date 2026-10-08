@@ -5,11 +5,24 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import time
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
-import os
-from pathlib import Path
+
+PBKDF2_ITERATIONS = 600_000
+TEACHERS_FILE = Path(__file__).parent / "teachers.json"
+SESSION_COOKIE_NAME = "mergington_teacher_session"
+SESSION_MAX_AGE = 8 * 60 * 60
+teacher_sessions = {}
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -88,9 +101,131 @@ def get_activities():
     return activities
 
 
+class TeacherLogin(BaseModel):
+    username: str
+    password: str
+
+
+def hash_teacher_password(password: str, salt: str = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("ascii"), PBKDF2_ITERATIONS
+    ).hex()
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt}${password_hash}"
+
+
+def verify_teacher_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iterations, salt, expected_hash = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        iterations = int(iterations)
+        if iterations < 100_000 or iterations > 2_000_000:
+            return False
+        actual_hash = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt.encode("ascii"), iterations
+        ).hex()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return hmac.compare_digest(actual_hash, expected_hash)
+
+
+def load_teacher_credentials() -> dict:
+    try:
+        data = json.loads(TEACHERS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher credentials are not configured correctly.",
+        ) from error
+
+    if not isinstance(data, dict) or not isinstance(data.get("teachers"), list):
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher credentials are not configured correctly.",
+        )
+
+    credentials = {}
+    for teacher in data["teachers"]:
+        if not isinstance(teacher, dict):
+            continue
+        username = teacher.get("username")
+        password_hash = teacher.get("password_hash")
+        if isinstance(username, str) and isinstance(password_hash, str):
+            credentials[username.casefold()] = {
+                "username": username,
+                "password_hash": password_hash,
+            }
+    return credentials
+
+
+def get_teacher_session(request: Request):
+    session_token = request.cookies.get(SESSION_COOKIE_NAME)
+    session = teacher_sessions.get(session_token)
+    if not session:
+        return None
+    if session["expires_at"] <= time.time():
+        teacher_sessions.pop(session_token, None)
+        return None
+    return session["username"]
+
+
+def require_teacher(request: Request) -> str:
+    username = get_teacher_session(request)
+    if username is None:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+    return username
+
+
+@app.get("/auth/status")
+def get_auth_status(request: Request):
+    username = get_teacher_session(request)
+    return {"authenticated": bool(username), "username": username}
+
+
+@app.post("/auth/login")
+def teacher_login(credentials: TeacherLogin, request: Request, response: Response):
+    teacher = load_teacher_credentials().get(credentials.username.strip().casefold())
+    if not teacher or not verify_teacher_password(
+        credentials.password, teacher["password_hash"]
+    ):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    session_token = secrets.token_urlsafe(32)
+    teacher_sessions[session_token] = {
+        "username": teacher["username"],
+        "expires_at": time.time() + SESSION_MAX_AGE,
+    }
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        session_token,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=os.getenv("COOKIE_SECURE") == "1",
+    )
+    return {"message": "Signed in successfully", "username": teacher["username"]}
+
+
+@app.post("/auth/logout")
+def teacher_logout(request: Request, response: Response):
+    session_token = request.cookies.get(SESSION_COOKIE_NAME)
+    if session_token:
+        teacher_sessions.pop(session_token, None)
+    response.delete_cookie(
+        SESSION_COOKIE_NAME,
+        httponly=True,
+        samesite="lax",
+        secure=os.getenv("COOKIE_SECURE") == "1",
+    )
+    return {"message": "Signed out successfully"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, request: Request):
     """Sign up a student for an activity"""
+    require_teacher(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +246,10 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, request: Request):
     """Unregister a student from an activity"""
+    require_teacher(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
